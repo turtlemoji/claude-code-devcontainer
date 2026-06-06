@@ -27,6 +27,7 @@ Usage: devc <command> [options]
 
 Commands:
     .                   Install devcontainer template to current directory and start
+    kata [runtime]      Like '.', but with Kata kernel isolation (own guest kernel)
     up                  Start the devcontainer in current directory
     rebuild             Rebuild the devcontainer (preserves auth volumes)
     down                Stop the devcontainer
@@ -44,6 +45,8 @@ Commands:
 
 Examples:
     devc .                      # Install template and start container
+    devc kata                   # Same as '.', with Kata kernel isolation
+    devc kata io.containerd.kata.v2  # Use a specific Kata runtime name
     devc up                     # Start container in current directory
     devc rebuild                # Clean rebuild
     devc shell                  # Open interactive shell
@@ -99,6 +102,67 @@ check_no_sys_admin() {
 
 get_workspace_folder() {
   echo "${1:-$(pwd)}"
+}
+
+# Default Kata runtime name. Override with DEVC_KATA_RUNTIME or the
+# positional arg to `devc kata`. The name is whatever key is registered
+# in /etc/docker/daemon.json (named-runtime setup), or the containerd
+# shim id (e.g. io.containerd.kata.v2).
+KATA_RUNTIME_DEFAULT="${DEVC_KATA_RUNTIME:-kata-runtime}"
+
+# Verify the requested Kata runtime is registered with the Docker daemon.
+# Fails loudly with setup guidance instead of letting `docker run` emit a
+# cryptic "unknown runtime" error deep inside the devcontainer CLI.
+check_kata_runtime() {
+  local runtime="$1"
+
+  if ! command -v docker &>/dev/null; then
+    log_error "docker not found on PATH."
+    exit 1
+  fi
+
+  local runtimes
+  runtimes=$(docker info --format '{{json .Runtimes}}' 2>/dev/null || echo '{}')
+
+  if echo "$runtimes" | jq -e --arg rt "$runtime" 'has($rt)' >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log_error "Kata runtime '$runtime' is not registered with the Docker daemon."
+  local available
+  available=$(echo "$runtimes" | jq -r 'keys | join(", ")' 2>/dev/null || true)
+  [[ -n "$available" ]] && log_info "Registered runtimes: $available"
+  echo "" >&2
+  log_info "To enable Kata (Linux host with hardware virtualization / KVM):"
+  log_info "  1. Install Kata Containers:"
+  log_info "       https://github.com/kata-containers/kata-containers"
+  log_info "  2. Register it in /etc/docker/daemon.json:"
+  log_info '       { "runtimes": { "kata-runtime": { "path": "/usr/bin/kata-runtime" } } }'
+  log_info "  3. Restart Docker:  sudo systemctl restart docker"
+  log_info "  4. Verify:          docker info --format '{{.Runtimes}}'"
+  echo "" >&2
+  log_info "Use a different runtime name with: DEVC_KATA_RUNTIME=<name> devc kata"
+  log_info "Note: Kata needs nested virtualization (KVM). It generally will NOT work"
+  log_info "inside macOS Docker Desktop/Colima VMs on Apple Silicon."
+  exit 1
+}
+
+# Inject (or replace) the Kata runtime in devcontainer.json runArgs.
+# Idempotent: strips any existing --runtime= entry before adding, so
+# repeated runs and runtime-name changes stay clean.
+add_kata_runtime() {
+  local devcontainer_json="$1"
+  local runtime="$2"
+
+  local updated
+  updated=$(jq --arg rt "--runtime=${runtime}" '
+    .runArgs = (
+      ((.runArgs // []) | map(select(startswith("--runtime=") | not)))
+      + [$rt]
+    )
+  ' "$devcontainer_json")
+
+  echo "$updated" >"$devcontainer_json"
 }
 
 # Extract custom mounts from devcontainer.json to a temp file
@@ -642,6 +706,40 @@ cmd_dot() {
   cmd_up "."
 }
 
+cmd_kata() {
+  # Same as `devc .`, but launches the container under the Kata runtime so
+  # it runs in a lightweight VM with its own guest kernel. This upgrades the
+  # isolation from "shared-host-kernel container" to "kernel-isolated VM",
+  # so a container escape lands in a throwaway VM rather than on the host.
+  local runtime="${1:-$KATA_RUNTIME_DEFAULT}"
+
+  local workspace_folder
+  workspace_folder="$(get_workspace_folder)"
+
+  check_devcontainer_cli
+  check_kata_runtime "$runtime"
+
+  # Install the template (mirrors `devc .` -> cmd_template).
+  cmd_template "."
+
+  local devcontainer_json="$workspace_folder/.devcontainer/devcontainer.json"
+  if [[ ! -f "$devcontainer_json" ]]; then
+    log_error "No devcontainer.json found after template install."
+    exit 1
+  fi
+
+  log_info "Enabling kernel isolation via Kata runtime: $runtime"
+  add_kata_runtime "$devcontainer_json" "$runtime"
+
+  # Re-run the security guard: --runtime is fine, but a stale/edited config
+  # must still never carry SYS_ADMIN (would defeat the read-only mount).
+  check_no_sys_admin "$workspace_folder"
+
+  log_info "Starting devcontainer in $workspace_folder..."
+  devcontainer up --workspace-folder "$workspace_folder"
+  log_success "Devcontainer started with Kata kernel isolation ($runtime)"
+}
+
 # Discovers all Docker resources associated with the current workspace.
 # Sets global variables: CONTAINER_ID, CONTAINER_STATUS, VOLUMES (array), IMAGE, IMAGE_UID
 discover_resources() {
@@ -804,6 +902,9 @@ main() {
   case "$command" in
   .)
     cmd_dot
+    ;;
+  kata)
+    cmd_kata "$@"
     ;;
   up)
     cmd_up "$@"

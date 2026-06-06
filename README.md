@@ -28,6 +28,12 @@ Running Claude with `bypassPermissions` on your host machine is risky—it can e
   ~/.claude-devcontainer/install.sh self-install
   ```
 
+- **(Optional) [Kata Containers](https://katacontainers.io/)** — only if you want
+  kernel-level isolation via `devc kata`. Requires a Linux host with hardware
+  virtualization (KVM) and the runtime registered with Docker. Not needed for the
+  default `devc .` workflow. See [Kernel Isolation with Kata](#kernel-isolation-with-kata)
+  for setup.
+
 <details>
 <summary><strong>Optimizing Colima for Apple Silicon</strong></summary>
 
@@ -134,6 +140,7 @@ If you don't set a token, the interactive login flow works as before.
 
 ```
 devc .              Install template + start container in current directory
+devc kata [runtime] Same as '.', but with Kata kernel isolation (VM-backed)
 devc up             Start the devcontainer
 devc rebuild        Rebuild container (preserves persistent volumes)
 devc destroy [-f]   Remove container, volumes, and image for current project
@@ -212,6 +219,49 @@ sudo iptables -A OUTPUT -j DROP
 - May break tools that require network access
 - DNS resolution still works (consider blocking if paranoid)
 
+## Kernel Isolation with Kata
+
+By default, the container shares your **host's kernel**. Filesystem and process isolation are enforced by namespaces and cgroups, but a kernel-level exploit or container-escape vulnerability would land directly on the host kernel. For higher-assurance reviews of genuinely untrusted code, run the container under [Kata Containers](https://katacontainers.io/), which executes each container inside a lightweight VM with its **own guest kernel**. A successful escape then lands in a disposable VM instead of on your host.
+
+```bash
+devc kata          # Install template + start, under the Kata runtime
+```
+
+`devc kata` works exactly like `devc .` — it installs the template and starts the container — but injects `--runtime=<kata>` into `runArgs` and verifies the runtime is registered with Docker before launching.
+
+### Runtime name
+
+The runtime name is whatever you registered with the Docker daemon, so it's configurable. `devc kata` defaults to `kata-runtime`; override it with a positional argument or the `DEVC_KATA_RUNTIME` environment variable:
+
+```bash
+devc kata io.containerd.kata.v2        # containerd shim name
+DEVC_KATA_RUNTIME=kata devc kata       # custom daemon.json name
+```
+
+### Host setup (one-time)
+
+Kata requires a Linux host with hardware virtualization (KVM):
+
+1. Install [Kata Containers](https://github.com/kata-containers/kata-containers/blob/main/docs/install/README.md).
+2. Register it in `/etc/docker/daemon.json`:
+
+   ```json
+   { "runtimes": { "kata-runtime": { "path": "/usr/bin/kata-runtime" } } }
+   ```
+
+3. Restart Docker: `sudo systemctl restart docker`
+4. Verify: `docker info --format '{{.Runtimes}}'`
+
+If the runtime isn't registered, `devc kata` stops with setup instructions instead of a cryptic Docker error.
+
+> **macOS note:** Kata needs nested virtualization. Docker Desktop and Colima run Linux inside a VM that generally does **not** expose KVM on Apple Silicon, so Kata typically won't work there. Use a Linux host (bare metal or a VM with nested virt enabled) for kernel isolation.
+
+### Trade-offs
+
+- Requires Kata + KVM on the host (see above); not available on most macOS setups.
+- Slightly slower container startup and higher memory overhead (a VM is booted per container).
+- Bind mounts (including `/workspace`) are shared into the guest via virtio-fs, so file I/O may differ in performance from a plain container.
+
 ## Threat Model
 
 The primary threat this project addresses is **Claude Code running arbitrary commands on your host machine**. When `bypassPermissions` is enabled, Claude executes shell commands, installs packages, and modifies files without confirmation. On a host machine this means it can modify your shell config, `rm -rf` outside the project directory, or abuse locally stored credentials. The devcontainer confines all of that to a disposable container where the blast radius is limited to `/workspace`.
@@ -226,9 +276,11 @@ This devcontainer provides **filesystem isolation** but not complete sandboxing.
 
 **Sandboxed:** Filesystem (host files inaccessible), processes (isolated from host), package installations (stay in container)
 
-**Not sandboxed:** Network (full outbound by default—see [Network Isolation](#network-isolation)), git identity (`~/.gitconfig` mounted read-only), SSH agent (socket forwarded, keys stay on host), Docker socket (not mounted by default)
+**Not sandboxed:** Network (full outbound by default—see [Network Isolation](#network-isolation)), git identity (`~/.gitconfig` mounted read-only), SSH agent (socket forwarded, keys stay on host), Docker socket (not mounted by default), **host kernel** (shared by default—see [Kernel Isolation with Kata](#kernel-isolation-with-kata))
 
 The container auto-configures `bypassPermissions` mode—Claude runs commands without confirmation. This would be risky on a host machine, but the container itself is the sandbox.
+
+By default the container shares the host kernel, so a kernel exploit or container escape would reach the host. For untrusted code where that matters, run under Kata (`devc kata`) to give the container its own guest kernel inside a VM.
 
 ## Container Details
 
