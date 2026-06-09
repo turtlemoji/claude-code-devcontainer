@@ -285,6 +285,12 @@ node_modules/
 
 [gpg "ssh"]
     program = /usr/bin/ssh-keygen
+
+[safe]
+    # Rootless Docker (and Kata) remap UIDs, so the bind-mounted /workspace
+    # appears owned by a different UID than the container user, tripping git's
+    # "dubious ownership" check. We own the files; mark the path safe.
+    directory = /workspace
 """
     local_gitconfig.write_text(local_config, encoding="utf-8")
     print(
